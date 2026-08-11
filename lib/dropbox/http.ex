@@ -12,6 +12,7 @@ defmodule Noizu.Dropbox.HTTP do
 
   alias Noizu.Dropbox.Client
   alias Noizu.Dropbox.Error
+  alias Noizu.Dropbox.OAuth
 
   @type options :: keyword() | map() | nil
   @type result :: {:ok, term()} | {:error, Error.t()}
@@ -97,7 +98,7 @@ defmodule Noizu.Dropbox.HTTP do
          {:ok, arg_json} <- Jason.encode(arg || %{}),
          {:ok, headers} <-
            build_headers(client, opts, :content_download, [{"Dropbox-API-Arg", arg_json}]) do
-      case do_request(method, url, headers, nil, client, opts) do
+      case do_request_with_retry(method, url, headers, nil, client, opts) do
         {:ok, %Finch.Response{status: status, body: body, headers: resp_headers}}
         when status in 200..299 ->
           metadata = decode_result_header(resp_headers)
@@ -159,7 +160,7 @@ defmodule Noizu.Dropbox.HTTP do
   # ---------------------------------------------------------------------------
 
   defp request(method, url, headers, body, client, opts) do
-    case do_request(method, url, headers, body, client, opts) do
+    case do_request_with_retry(method, url, headers, body, client, opts) do
       {:ok, %Finch.Response{status: status, body: resp_body}} when status in 200..299 ->
         {:ok, status, resp_body}
 
@@ -170,6 +171,73 @@ defmodule Noizu.Dropbox.HTTP do
         {:error, Error.transport(reason)}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # 401 auto-refresh retry
+  # ---------------------------------------------------------------------------
+
+  defp do_request_with_retry(method, url, headers, body, client, opts) do
+    original = do_request(method, url, headers, body, client, opts)
+
+    case maybe_refresh_retry(original, method, url, headers, body, client, opts) do
+      nil -> original
+      retried -> retried
+    end
+  end
+
+  # Attempt a single OAuth refresh + retry when the original response is a 401
+  # on a Bearer-authenticated call and the client has a refresh_token.
+  # Returns the retried `do_request/6` result, or `nil` to keep the original.
+  defp maybe_refresh_retry(
+         {:ok, %Finch.Response{status: 401}},
+         method,
+         url,
+         headers,
+         body,
+         %Client{refresh_token: refresh_token} = client,
+         opts
+       )
+       when is_binary(refresh_token) and refresh_token != "" do
+    if Keyword.get(opts, :__retried_401, false) or not has_bearer_auth?(headers) do
+      nil
+    else
+      case OAuth.refresh_client(client) do
+        {:ok, refreshed, _} ->
+          new_headers = replace_bearer_token(headers, refreshed)
+          retry_opts = Keyword.put(opts, :__retried_401, true)
+          do_request(method, url, new_headers, body, refreshed, retry_opts)
+
+        {:error, _} ->
+          nil
+      end
+    end
+  end
+
+  defp maybe_refresh_retry(_, _, _, _, _, _, _), do: nil
+
+  defp has_bearer_auth?(headers) do
+    Enum.any?(headers, fn
+      {k, "Bearer " <> _} -> String.downcase(k) == "authorization"
+      _ -> false
+    end)
+  end
+
+  defp replace_bearer_token(headers, %Client{access_token: token})
+       when is_binary(token) and token != "" do
+    Enum.map(headers, fn
+      {k, "Bearer " <> _} = pair ->
+        if String.downcase(k) == "authorization" do
+          {k, "Bearer #{token}"}
+        else
+          pair
+        end
+
+      other ->
+        other
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
 
   defp do_request(method, url, headers, body, client, opts) do
     timeout = Keyword.get(opts, :timeout, client.receive_timeout)

@@ -2,6 +2,14 @@ defmodule Noizu.Dropbox.HTTPTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  setup do
+    Application.delete_env(:noizu_dropbox, :request_fun)
+
+    on_exit(fn ->
+      Application.delete_env(:noizu_dropbox, :request_fun)
+    end)
+  end
+
   alias Noizu.Dropbox.Client
   alias Noizu.Dropbox.Error
   alias Noizu.Dropbox.HTTP
@@ -120,6 +128,94 @@ defmodule Noizu.Dropbox.HTTPTest do
 
     assert {:ok, %{account_id: "dbid:1"}} =
              HTTP.rpc("users/get_current_account", body: nil, client: @client)
+  end
+
+  test "rpc auto-refreshes on 401 and retries once" do
+    client =
+      Client.new(
+        access_token: "stale",
+        refresh_token: "ref-token",
+        app_key: "APP",
+        app_secret: "SEC"
+      )
+
+    Process.put(:api_call_count, 0)
+
+    Application.put_env(:noizu_dropbox, :request_fun, fn %{url: url, headers: headers} ->
+      cond do
+        String.contains?(url, "/oauth2/token") ->
+          FinchStub.json_response(200, %{"access_token" => "fresh-token", "expires_in" => 14400})
+
+        true ->
+          count = Process.get(:api_call_count, 0) + 1
+          Process.put(:api_call_count, count)
+
+          if count == 2 do
+            assert header(headers, "authorization") == "Bearer fresh-token"
+          end
+
+          if count == 1 do
+            FinchStub.json_response(401, %{"error_summary" => "expired_access_token/."})
+          else
+            FinchStub.json_response(200, %{"ok" => true})
+          end
+      end
+    end)
+
+    assert {:ok, %{ok: true}} = HTTP.rpc("check/user", body: %{query: "ping"}, client: client)
+    assert Process.get(:api_call_count, 0) == 2
+  end
+
+  test "rpc 401 without refresh_token returns error and does not retry" do
+    Process.put(:api_call_count, 0)
+
+    Application.put_env(:noizu_dropbox, :request_fun, fn %{url: url} ->
+      unless String.contains?(url, "/oauth2/token") do
+        count = Process.get(:api_call_count, 0) + 1
+        Process.put(:api_call_count, count)
+      end
+
+      FinchStub.json_response(401, %{"error_summary" => "expired_access_token/."})
+    end)
+
+    assert {:error, %Error{status: 401}} =
+             HTTP.rpc("check/user", body: %{query: "ping"}, client: @client)
+
+    assert Process.get(:api_call_count, 0) == 1
+  end
+
+  test "content_download auto-refreshes on 401 and retries once" do
+    client =
+      Client.new(
+        access_token: "stale",
+        refresh_token: "ref-token",
+        app_key: "APP",
+        app_secret: "SEC"
+      )
+
+    Process.put(:download_call_count, 0)
+
+    Application.put_env(:noizu_dropbox, :request_fun, fn %{url: url} ->
+      cond do
+        String.contains?(url, "/oauth2/token") ->
+          FinchStub.json_response(200, %{"access_token" => "fresh-dl", "expires_in" => 14400})
+
+        true ->
+          count = Process.get(:download_call_count, 0) + 1
+          Process.put(:download_call_count, count)
+
+          if count == 1 do
+            FinchStub.json_response(401, %{"error_summary" => "expired/."})
+          else
+            FinchStub.download_response(200, %{"name" => "a.txt", "size" => 2}, "ab")
+          end
+      end
+    end)
+
+    assert {:ok, %{body: "ab"}} =
+             HTTP.content_download("files/download", %{path: "/a.txt"}, client: client)
+
+    assert Process.get(:download_call_count, 0) == 2
   end
 
   defp header(headers, name) do
