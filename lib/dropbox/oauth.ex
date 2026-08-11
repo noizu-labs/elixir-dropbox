@@ -87,6 +87,7 @@ defmodule Noizu.Dropbox.OAuth do
     opts = normalize(opts)
     client = Keyword.get(opts, :client) || Client.default()
     code = Keyword.fetch!(opts, :code)
+    use_basic = basic?(client, opts)
 
     form =
       [
@@ -96,10 +97,10 @@ defmodule Noizu.Dropbox.OAuth do
       |> maybe_kw(:redirect_uri, Keyword.get(opts, :redirect_uri))
       |> maybe_kw(:code_verifier, Keyword.get(opts, :code_verifier))
       |> maybe_kw(:client_id, Keyword.get(opts, :client_id) || client.app_key)
-      |> maybe_kw(:client_secret, Keyword.get(opts, :client_secret) || client.app_secret)
+      |> maybe_secret(use_basic, Keyword.get(opts, :client_secret) || client.app_secret)
 
     url = Client.normalize_base(client.oauth_base) <> "token"
-    HTTP.form_post(url, form, client: client, basic_auth: basic?(client, opts))
+    HTTP.form_post(url, form, client: client, basic_auth: use_basic)
   end
 
   @doc """
@@ -109,6 +110,7 @@ defmodule Noizu.Dropbox.OAuth do
   def refresh_token(refresh_token, opts \\ []) when is_binary(refresh_token) do
     opts = normalize(opts)
     client = Keyword.get(opts, :client) || Client.default()
+    use_basic = basic?(client, opts)
 
     form =
       [
@@ -116,10 +118,10 @@ defmodule Noizu.Dropbox.OAuth do
         refresh_token: refresh_token
       ]
       |> maybe_kw(:client_id, Keyword.get(opts, :client_id) || client.app_key)
-      |> maybe_kw(:client_secret, Keyword.get(opts, :client_secret) || client.app_secret)
+      |> maybe_secret(use_basic, Keyword.get(opts, :client_secret) || client.app_secret)
 
     url = Client.normalize_base(client.oauth_base) <> "token"
-    HTTP.form_post(url, form, client: client, basic_auth: basic?(client, opts))
+    HTTP.form_post(url, form, client: client, basic_auth: use_basic)
   end
 
   @doc """
@@ -171,6 +173,13 @@ defmodule Noizu.Dropbox.OAuth do
   defp maybe_kw(kw, _k, nil), do: kw
   defp maybe_kw(kw, _k, ""), do: kw
   defp maybe_kw(kw, k, v), do: Keyword.put(kw, k, v)
+
+  # When basic_auth is used, the client_secret travels in the Authorization
+  # header — never also in the form body (Dropbox rejects the double-send).
+  defp maybe_secret(kw, true, _secret), do: kw
+  defp maybe_secret(kw, false, nil), do: kw
+  defp maybe_secret(kw, false, ""), do: kw
+  defp maybe_secret(kw, false, secret), do: Keyword.put(kw, :client_secret, secret)
 
   defp bool_param(nil), do: nil
   defp bool_param(true), do: "true"
