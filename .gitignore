@@ -9,3 +9,6 @@ erl_crash.dump
 *.tar
 /tmp/
 .elixir_ls/
+
+# Canonical worktree placement
+.claude/worktrees/
